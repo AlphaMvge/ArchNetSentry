@@ -1,0 +1,9 @@
+[Unit]
+Description=ArchNetSentry Automated Network Security & Audit Scanner
+After=network.target systemd-resolved.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/archnetsentry --report --no-color
+StandardOutput=journal
+StandardError=journal

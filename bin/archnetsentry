@@ -1,0 +1,713 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# ArchNetSentry - Arch Linux / Linux Network Security Audit & Hardening Tool
+# Equivalent of WinNetSentry (https://github.com/AlphaMvge/WinNetSentry)
+# Designed for Arch Linux & systemd / NetworkManager / systemd-resolved systems
+# License: MIT
+# ==============================================================================
+
+set -uo pipefail
+
+VERSION="1.0.0"
+VERBOSE=0
+SKIP_MENU=0
+NO_COLOR=0
+JSON_OUTPUT=0
+DNS_PROVIDER="cloudflare"
+
+# --- Color Scheme ---
+setup_colors() {
+    if [[ $NO_COLOR -eq 1 ]] || [[ ! -t 1 && $JSON_OUTPUT -eq 1 ]]; then
+        RED="" GREEN="" YELLOW="" CYAN="" MAGENTA="" GRAY="" NC="" BOLD=""
+    else
+        RED='\033[0;31m'
+        GREEN='\033[0;32m'
+        YELLOW='\033[1;33m'
+        CYAN='\033[0;36m'
+        MAGENTA='\033[0;35m'
+        GRAY='\033[0;90m'
+        BOLD='\033[1m'
+        NC='\033[0m'
+    fi
+}
+
+# --- Logging Helpers ---
+log()  { echo -e "${CYAN}[*]${NC} $*"; }
+ok()   { echo -e "${GREEN}[+]${NC} $*"; }
+warn() { echo -e "${YELLOW}[!]${NC} $*"; }
+err()  { echo -e "${RED}[-]${NC} $*"; }
+vlog() { [[ $VERBOSE -eq 1 ]] && echo -e "${GRAY}[V] $*${NC}"; }
+
+# --- Elevate Root Privileges Safely ---
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log "ArchNetSentry requires root privileges. Elevating with sudo..."
+        local script_path="${BASH_SOURCE[0]:-$0}"
+        exec sudo -E bash "$script_path" "$@"
+    fi
+}
+
+# --- Banner & Header ---
+show_banner() {
+    [[ $NO_COLOR -eq 1 ]] || clear 2>/dev/null || true
+    cat << 'EOF'
+ █████╗ ██████╗  ██████╗██╗  ██╗███╗   ██╗███████╗████████╗███████╗███████╗███╗   ██╗████████╗██████╗ ██╗   ██╗
+██╔══██╗██╔══██╗██╔════╝██║  ██║████╗  ██║██╔════╝╚══██╔══╝██╔════╝██╔════╝████╗  ██║╚══██╔══╝██╔══██╗╚██╗ ██╔╝
+███████║██████╔╝██║     ███████║██╔██╗ ██║█████╗     ██║   ███████╗█████╗  ██╔██╗ ██║   ██║   ██████╔╝ ╚████╔╝ 
+██╔══██║██╔══██╗██║     ██╔══██║██║╚██╗██║██╔══╝     ██║   ╚════██║██╔══╝  ██║╚██╗██║   ██║   ██╔══██╗  ╚██╔╝  
+██║  ██║██║  ██║╚██████╗██║  ██║██║ ╚████║███████╗   ██║   ███████║███████╗██║ ╚████║   ██║   ██║  ██║   ██║   
+╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝   ╚═╝   ╚══════╝╚══════╝╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝   ╚═╝   
+EOF
+    echo -e "${CYAN}                  -- [ Arch/Linux Network Audit, DoH Securing & MAC Spoofing Tool ] --${NC}"
+    echo -e "${CYAN}                  -- [           Developed for Privacy, Hardening & Security        ] --${NC}"
+    echo "===================================================================================================="
+}
+
+show_header() {
+    echo -e "\n${MAGENTA}[>>>] $1${NC}"
+    echo "------------------------------------------------------------"
+}
+
+pause() {
+    if [[ $SKIP_MENU -eq 0 && -t 0 ]]; then
+        echo -e "\n${YELLOW}Press Enter to return to the main menu...${NC}"
+        read -r _ || true
+    fi
+}
+
+# --- Module 1: Network Listener & Connection Auditor ---
+audit_network_ports() {
+    show_header "ACTIVE NETWORK LISTENERS & CONNECTIONS"
+    vlog "Enumerating active sockets using ss..."
+
+    echo -e "\n${CYAN}[!] ACTIVE LISTENERS (PORTS OPEN TO CONNECTION):${NC}"
+    if command -v ss >/dev/null 2>&1; then
+        ss -tulnp 2>/dev/null | awk '
+        BEGIN { printf "%-6s %-22s %-8s %-25s %s\n", "Proto", "Local Address", "Port", "Process", "PID" }
+        NR>1 {
+            proto=$1; addr=$5; users=$0
+            split(addr, a, ":"); port=a[length(a)]
+            proc="?"; pid="?"
+            if (match(users, /users:\(\("[^"]+",pid=[0-9]+/)) {
+                seg=substr(users, RSTART, RLENGTH)
+                sub(/^users:\(\("/, "", seg)
+                proc_name=seg; sub(/",pid=.*/, "", proc_name); proc=proc_name
+                if (match(seg, /pid=[0-9]+/)) {
+                    pid=substr(seg, RSTART+4, RLENGTH-4)
+                }
+            }
+            printf "%-6s %-22s %-8s %-25s %s\n", proto, addr, port, proc, pid
+        }' || warn "Failed to format socket output."
+    else
+        err "ss tool not found. Please install iproute2."
+    fi
+
+    echo -e "\n${CYAN}[!] ESTABLISHED NETWORK CONNECTIONS:${NC}"
+    if command -v ss >/dev/null 2>&1; then
+        ss -tunp state established 2>/dev/null | awk '
+        BEGIN { printf "%-6s %-25s %-25s %-20s %s\n", "Proto", "Local", "Remote", "Process", "PID" }
+        NR>1 {
+            proto=$1; local=$4; remote=$5; users=$0
+            proc="?"; pid="?"
+            if (match(users, /users:\(\("[^"]+",pid=[0-9]+/)) {
+                seg=substr(users, RSTART, RLENGTH)
+                sub(/^users:\(\("/, "", seg)
+                proc_name=seg; sub(/",pid=.*/, "", proc_name); proc=proc_name
+                if (match(seg, /pid=[0-9]+/)) {
+                    pid=substr(seg, RSTART+4, RLENGTH-4)
+                }
+            }
+            printf "%-6s %-25s %-25s %-20s %s\n", proto, local, remote, proc, pid
+        }' || warn "Failed to format established connections output."
+    fi
+}
+
+# --- Module 2: Suspicious Process & Anomaly Detector ---
+hunt_sketchy_processes() {
+    show_header "SUSPICIOUS PROCESS & ANOMALY DETECTOR"
+    vlog "Scanning process list for path anomalies and unowned binaries..."
+
+    local flagged=0
+    echo -e "${CYAN}Running process heuristics scanner...${NC}\n"
+
+    local system_bins=(sshd nginx apache2 httpd python python3 node java bash dash sh systemd)
+
+    while read -r pid path; do
+        [[ -z "$pid" || -z "$path" ]] && continue
+        
+        # Skip non-existent files / kernel threads instantly
+        [[ ! -f "$path" ]] && continue
+        [[ "$path" =~ ^/proc/ ]] && continue
+
+        local name
+        name=$(basename "$path" 2>/dev/null || echo "?")
+        local reasons=()
+
+        # 1. System binary path spoofing
+        for bin in "${system_bins[@]}"; do
+            if [[ "$name" == "$bin" || "$name" == "${bin}."* ]]; then
+                if [[ ! "$path" =~ ^/(usr/)?(s)?bin/ && ! "$path" =~ ^/usr/lib ]]; then
+                    reasons+=("System-like binary executed from non-standard location: $path")
+                fi
+            fi
+        done
+
+        # 2. Executing from volatile/temp directories
+        if [[ "$path" =~ /(tmp|Temp|cache|Cache|/dev/shm|/var/tmp)/ ]]; then
+            reasons+=("Binary executing from temporary or volatile directory: $path")
+        fi
+
+        # 3. Missing execute permissions
+        if [[ ! -x "$path" ]]; then
+            reasons+=("Executing file lacks standard executable permissions bit")
+        fi
+
+        # 4. Package ownership check on Arch Linux
+        if command -v pacman >/dev/null 2>&1; then
+            if ! pacman -Qo "$path" >/dev/null 2>&1; then
+                # Check if process has open network sockets
+                if ss -tulnp 2>/dev/null | grep -q "pid=$pid," 2>/dev/null; then
+                    reasons+=("Listening network process is NOT owned by any Arch pacman package")
+                fi
+            fi
+        fi
+
+        if [[ ${#reasons[@]} -gt 0 ]]; then
+            flagged=1
+            echo -e "${RED}PID $pid | $name${NC}"
+            echo -e "  Path   : $path"
+            for r in "${reasons[@]}"; do
+                echo -e "  Reason : $r"
+            done
+            echo
+        fi
+    done < <(
+        for p in /proc/[0-9]*; do
+            pid="${p#/proc/}"
+            if [[ -f "$p/exe" ]]; then
+                exe=$(readlink -f "$p/exe" 2>/dev/null || true)
+                [[ -n "$exe" ]] && echo "$pid $exe"
+            fi
+        done
+    )
+
+    if [[ $flagged -eq 0 ]]; then
+        ok "No anomalous processes or sketchy listening binaries detected."
+    else
+        warn "Review flagged processes above carefully to verify authenticity."
+    fi
+}
+
+# --- Module 3: DNS Leak & Encryption Auditor ---
+get_dns_status() {
+    show_header "DNS SECURITY & ENCRYPTION STATUS"
+    vlog "Checking systemd-resolved and resolv.conf state..."
+
+    local dns_secure=1
+
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        echo -e "${CYAN}systemd-resolved daemon is ACTIVE${NC}"
+        local resolvectl_out
+        resolvectl_out=$(resolvectl status 2>/dev/null || true)
+
+        if echo "$resolvectl_out" | grep -qiE "DNSOverTLS.*yes|DNSOverHTTPS.*yes|DNSOverTLS: yes"; then
+            ok "DNS-over-TLS / DoH encryption is ENABLED"
+        else
+            err "DNS-over-TLS / DoH is NOT enforced"
+            dns_secure=0
+        fi
+
+        echo -e "\n${CYAN}Active DNS Uplink Servers:${NC}"
+        echo "$resolvectl_out" | grep -E "DNS Servers|Link|DNS Domain" | head -30 || true
+    else
+        warn "systemd-resolved is inactive. Checking fallback /etc/resolv.conf..."
+        dns_secure=0
+    fi
+
+    echo -e "\n${CYAN}/etc/resolv.conf Configuration:${NC}"
+    if [[ -f /etc/resolv.conf ]]; then
+        cat /etc/resolv.conf
+    else
+        err "/etc/resolv.conf does not exist!"
+    fi
+
+    # Check for encrypted public resolvers
+    local has_cloudflare=0
+    local has_quad9=0
+    local has_mullvad=0
+
+    grep -qE "1\.1\.1\.1|1\.0\.0\.1|2606:4700" /etc/resolv.conf 2>/dev/null && has_cloudflare=1 || true
+    resolvectl status 2>/dev/null | grep -qE "1\.1\.1\.1|1\.0\.0\.1|cloudflare" && has_cloudflare=1 || true
+
+    grep -qE "9\.9\.9\.9|149\.112\.112\.112" /etc/resolv.conf 2>/dev/null && has_quad9=1 || true
+    resolvectl status 2>/dev/null | grep -qE "9\.9\.9\.9|quad9" && has_quad9=1 || true
+
+    grep -qE "194\.242\.2\.2" /etc/resolv.conf 2>/dev/null && has_mullvad=1 || true
+    resolvectl status 2>/dev/null | grep -qE "mullvad" && has_mullvad=1 || true
+
+    if [[ $has_cloudflare -eq 1 ]]; then
+        ok "Cloudflare Encrypted DNS detected."
+    elif [[ $has_quad9 -eq 1 ]]; then
+        ok "Quad9 Secure DNS detected."
+    elif [[ $has_mullvad -eq 1 ]]; then
+        ok "Mullvad Encrypted DNS detected."
+    else
+        warn "No standard encrypted DNS resolver detected. Plaintext DNS leak risk!"
+        dns_secure=0
+    fi
+
+    if [[ $dns_secure -eq 1 ]]; then
+        ok "DNS configuration is secure against unencrypted eavesdropping."
+    else
+        err "DNS is unencrypted or exposed. Run option [4] or --doh to enforce DoT/DoH."
+    fi
+}
+
+# --- Module 4: Enforce Encrypted DNS (DoT/DoH) ---
+set_secure_dns() {
+    local provider="${1:-$DNS_PROVIDER}"
+    show_header "ENFORCING DNS-OVER-TLS / DoH ($provider)"
+
+    if ! systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        log "Enabling and starting systemd-resolved..."
+        systemctl enable --now systemd-resolved 2>/dev/null || true
+    fi
+
+    local conf_dir="/etc/systemd/resolved.conf.d"
+    local conf_file="$conf_dir/99-archnetsentry-doh.conf"
+    mkdir -p "$conf_dir"
+
+    case "${provider,,}" in
+        quad9)
+            log "Applying Quad9 DNS-over-TLS configuration..."
+            cat > "$conf_file" << 'EOF'
+[Resolve]
+DNS=9.9.9.9#dns.quad9.net 149.112.112.112#dns.quad9.net 2620:fe::fe#dns.quad9.net
+FallbackDNS=1.1.1.1#cloudflare-dns.com
+DNSOverTLS=yes
+DNSSEC=allow-downgrade
+Domains=~.
+EOF
+            ;;
+        adguard)
+            log "Applying AdGuard Default DNS-over-TLS configuration..."
+            cat > "$conf_file" << 'EOF'
+[Resolve]
+DNS=94.140.14.14#dns.adguard.com 94.140.15.15#dns.adguard.com
+FallbackDNS=1.1.1.1#cloudflare-dns.com
+DNSOverTLS=yes
+DNSSEC=allow-downgrade
+Domains=~.
+EOF
+            ;;
+        mullvad)
+            log "Applying Mullvad Encrypted DNS-over-TLS configuration..."
+            cat > "$conf_file" << 'EOF'
+[Resolve]
+DNS=194.242.2.2#dns.mullvad.net
+FallbackDNS=9.9.9.9#dns.quad9.net
+DNSOverTLS=yes
+DNSSEC=allow-downgrade
+Domains=~.
+EOF
+            ;;
+        *)
+            log "Applying Cloudflare DNS-over-TLS configuration..."
+            cat > "$conf_file" << 'EOF'
+[Resolve]
+DNS=1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com 2606:4700:4700::1111#cloudflare-dns.com 2606:4700:4700::1001#cloudflare-dns.com
+FallbackDNS=9.9.9.9#dns.quad9.net
+DNSOverTLS=yes
+DNSSEC=allow-downgrade
+Domains=~.
+EOF
+            ;;
+    esac
+
+    # Ensure /etc/resolv.conf links to systemd-resolved stub
+    if [[ -f /etc/resolv.conf && ! -L /etc/resolv.conf ]]; then
+        log "Backing up /etc/resolv.conf and creating symlink to systemd-resolved..."
+        cp /etc/resolv.conf /etc/resolv.conf.bak.archnetsentry 2>/dev/null || true
+        ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+    fi
+
+    systemctl restart systemd-resolved 2>/dev/null || true
+    sleep 1
+
+    ok "Encrypted DNS-over-TLS configuration successfully applied!"
+    resolvectl status 2>/dev/null | head -25 || true
+}
+
+# --- Module 5 & 6: MAC Address Spoofing & Restoration ---
+generate_random_mac() {
+    local second=("2" "6" "A" "E")
+    local hex=("0" "1" "2" "3" "4" "5" "6" "7" "8" "9" "A" "B" "C" "D" "E" "F")
+    local mac="${hex[$((RANDOM%16))]}${second[$((RANDOM%4))]}"
+    for i in {1..5}; do
+        mac+=":${hex[$((RANDOM%16))]}${hex[$((RANDOM%16))]}"
+    done
+    echo "$mac"
+}
+
+list_physical_ifaces() {
+    ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -vE '^(lo|docker|veth|br-|virbr|tun|tap|wg|tailscale)' || true
+}
+
+change_mac_address() {
+    local target_iface="${1:-}"
+    show_header "SPOOF NETWORK ADAPTER MAC ADDRESS"
+
+    mapfile -t ifaces < <(list_physical_ifaces)
+    if [[ ${#ifaces[@]} -eq 0 ]]; then
+        err "No physical network interfaces found to spoof."
+        return 1
+    fi
+
+    local iface=""
+    if [[ -n "$target_iface" ]]; then
+        iface="$target_iface"
+    else
+        echo -e "${CYAN}Available Interfaces:${NC}"
+        for i in "${!ifaces[@]}"; do
+            local mac
+            mac=$(ip link show "${ifaces[$i]}" 2>/dev/null | grep -oP 'link/ether \K[0-9a-f:]+' || echo "unknown")
+            echo -e "  [${i}] ${ifaces[$i]}  (current MAC: $mac)"
+        done
+
+        local choice
+        while true; do
+            read -rp $'\nEnter interface selection index: ' choice || return 0
+            if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 0 && choice < ${#ifaces[@]} )); then
+                iface="${ifaces[$choice]}"
+                break
+            fi
+            err "Invalid interface index."
+        done
+    fi
+
+    local newmac
+    newmac=$(generate_random_mac)
+    log "Spoofing MAC address of $iface to $newmac..."
+
+    ip link set dev "$iface" down 2>/dev/null || true
+    ip link set dev "$iface" address "$newmac" 2>/dev/null || true
+    ip link set dev "$iface" up 2>/dev/null || true
+
+    sleep 1
+    local current
+    current=$(ip link show "$iface" 2>/dev/null | grep -oP 'link/ether \K[0-9a-f:]+' || echo "unknown")
+
+    if [[ "${current,,}" == "${newmac,,}" ]]; then
+        ok "MAC spoof verified for interface $iface!"
+        echo "  Spoofed MAC: $current"
+    else
+        warn "MAC spoofing failed or was reverted by NetworkManager/driver."
+        echo "  Active MAC: $current"
+    fi
+}
+
+restore_mac_address() {
+    local target_iface="${1:-}"
+    show_header "RESTORE ORIGINAL ADAPTER MAC ADDRESS"
+
+    mapfile -t ifaces < <(list_physical_ifaces)
+    if [[ ${#ifaces[@]} -eq 0 ]]; then
+        err "No physical interfaces found."
+        return 1
+    fi
+
+    local iface=""
+    if [[ -n "$target_iface" ]]; then
+        iface="$target_iface"
+    else
+        echo -e "${CYAN}Available Interfaces:${NC}"
+        for i in "${!ifaces[@]}"; do
+            local mac
+            mac=$(ip link show "${ifaces[$i]}" 2>/dev/null | grep -oP 'link/ether \K[0-9a-f:]+' || echo "unknown")
+            echo -e "  [${i}] ${ifaces[$i]}  (current MAC: $mac)"
+        done
+
+        local choice
+        while true; do
+            read -rp $'\nEnter interface selection index: ' choice || return 0
+            if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 0 && choice < ${#ifaces[@]} )); then
+                iface="${ifaces[$choice]}"
+                break
+            fi
+            err "Invalid index."
+        done
+    fi
+
+    log "Restoring permanent hardware MAC address for $iface..."
+
+    if command -v ethtool >/dev/null 2>&1; then
+        local perm
+        perm=$(ethtool -P "$iface" 2>/dev/null | awk '{print $3}' || true)
+        if [[ -n "$perm" && "$perm" != "00:00:00:00:00:00" ]]; then
+            ip link set dev "$iface" down 2>/dev/null || true
+            ip link set dev "$iface" address "$perm" 2>/dev/null || true
+            ip link set dev "$iface" up 2>/dev/null || true
+            ok "Restored hardware permanent MAC: $perm"
+            return 0
+        fi
+    fi
+
+    # NetworkManager interface cycle fallback
+    if command -v nmcli >/dev/null 2>&1; then
+        log "Resetting interface connection via NetworkManager..."
+        nmcli device disconnect "$iface" 2>/dev/null || true
+        nmcli device connect "$iface" 2>/dev/null || true
+    else
+        ip link set dev "$iface" down 2>/dev/null || true
+        sleep 1
+        ip link set dev "$iface" up 2>/dev/null || true
+    fi
+
+    local current
+    current=$(ip link show "$iface" 2>/dev/null | grep -oP 'link/ether \K[0-9a-f:]+' || echo "unknown")
+    ok "Interface cycle completed. Active MAC: $current"
+}
+
+# --- Module 7: Generate Security Audit Reports ---
+save_security_report() {
+    show_header "GENERATING SECURITY AUDIT REPORTS"
+
+    local log_dir="/var/log/archnetsentry"
+    mkdir -p "$log_dir" 2>/dev/null || log_dir="${HOME}/.local/share/archnetsentry/reports"
+    mkdir -p "$log_dir" 2>/dev/null || true
+
+    local ts
+    ts=$(date +%Y%m%d_%H%M%S)
+    local json_path="$log_dir/audit_report_${ts}.json"
+    local md_path="$log_dir/audit_report_${ts}.md"
+
+    local listeners
+    listeners=$(ss -tulnp 2>/dev/null || echo "ss unavailable")
+    local established
+    established=$(ss -tunp state established 2>/dev/null || echo "none")
+    local dns_info
+    dns_info=$(resolvectl status 2>/dev/null || cat /etc/resolv.conf 2>/dev/null || echo "unavailable")
+
+    # Write JSON Report
+    if command -v jq >/dev/null 2>&1; then
+        jq -n \
+            --arg timestamp "$(date -Iseconds)" \
+            --arg hostname "$(hostname)" \
+            --arg kernel "$(uname -r)" \
+            --arg dns "$dns_info" \
+            --arg listeners "$listeners" \
+            --arg established "$established" \
+            '{timestamp: $timestamp, hostname: $hostname, kernel: $kernel, dns: $dns, listeners: $listeners, established: $established}' > "$json_path"
+    else
+        cat > "$json_path" << EOF
+{
+  "timestamp": "$(date -Iseconds)",
+  "hostname": "$(hostname)",
+  "kernel": "$(uname -r)"
+}
+EOF
+    fi
+
+    # Write Markdown Report
+    cat > "$md_path" << EOF
+# ArchNetSentry Security Audit Report
+
+**Generated**: $(date)
+**Hostname**: $(hostname)
+**Kernel**: $(uname -r)
+
+---
+
+## 1. DNS Security & Resolver Configuration
+
+\`\`\`
+$dns_info
+\`\`\`
+
+---
+
+## 2. Active Listening Network Ports
+
+\`\`\`
+$listeners
+\`\`\`
+
+---
+
+## 3. Established Network Connections
+
+\`\`\`
+$established
+\`\`\`
+
+---
+
+*Generated automatically by ArchNetSentry Security Audit Suite.*
+EOF
+
+    ok "JSON Report saved : $json_path"
+    ok "Markdown Report saved : $md_path"
+}
+
+# --- Output Raw JSON Audit to stdout ---
+output_raw_json() {
+    local listeners established dns_info
+    listeners=$(ss -tulnp 2>/dev/null || echo "")
+    established=$(ss -tunp state established 2>/dev/null || echo "")
+    dns_info=$(resolvectl status 2>/dev/null || cat /etc/resolv.conf 2>/dev/null || echo "")
+
+    if command -v jq >/dev/null 2>&1; then
+        jq -n \
+            --arg timestamp "$(date -Iseconds)" \
+            --arg hostname "$(hostname)" \
+            --arg kernel "$(uname -r)" \
+            --arg dns "$dns_info" \
+            --arg listeners "$listeners" \
+            --arg established "$established" \
+            '{timestamp: $timestamp, hostname: $hostname, kernel: $kernel, dns: $dns, listeners: $listeners, established: $established}'
+    else
+        echo '{"error": "jq required for raw json stdout"}'
+    fi
+}
+
+# --- Show Help ---
+show_help() {
+    cat << EOF
+ArchNetSentry v${VERSION} - Arch Linux Network Audit, DoH Securing & MAC Spoofing Tool
+
+Usage: archnetsentry [OPTIONS]
+
+Options:
+  -a, --audit          Audit active network listeners and established connections
+  -H, --hunt           Run process anomaly heuristics scanner
+  -d, --dns            Audit DNS leak status and encryption configuration
+  -D, --doh [PROVIDER] Enforce DNS-over-TLS (Providers: cloudflare, quad9, adguard, mullvad)
+  -m, --spoof-mac [IF] Spoof network interface MAC address to random locally-administered MAC
+  -r, --restore-mac [IF] Restore network interface hardware permanent MAC address
+  -R, --report         Generate unified JSON and Markdown security audit reports
+  --json               Output raw JSON security audit to stdout
+  --no-color           Disable ANSI color codes in output
+  -v, --version        Display version information
+  -h, --help           Show this help message
+
+Examples:
+  sudo archnetsentry                      # Launch interactive menu
+  sudo archnetsentry --audit              # Run port audit directly
+  sudo archnetsentry --doh cloudflare     # Enforce Cloudflare DNS-over-TLS
+  sudo archnetsentry --spoof-mac wlan0    # Spoof wlan0 MAC address
+EOF
+}
+
+# --- Main CLI Argument Router & Interactive Loop ---
+main() {
+    setup_colors
+
+    # Parse CLI Arguments
+    if [[ $# -gt 0 ]]; then
+        SKIP_MENU=1
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -a|--audit)
+                    require_root "$@"
+                    audit_network_ports
+                    shift ;;
+                -H|--hunt)
+                    require_root "$@"
+                    hunt_sketchy_processes
+                    shift ;;
+                -d|--dns)
+                    require_root "$@"
+                    get_dns_status
+                    shift ;;
+                -D|--doh)
+                    require_root "$@"
+                    local prov="${2:-cloudflare}"
+                    if [[ "$prov" =~ ^- ]]; then prov="cloudflare"; else shift; fi
+                    set_secure_dns "$prov"
+                    shift ;;
+                -m|--spoof-mac)
+                    require_root "$@"
+                    local iface="${2:-}"
+                    if [[ "$iface" =~ ^- ]]; then iface=""; else shift; fi
+                    change_mac_address "$iface"
+                    shift ;;
+                -r|--restore-mac)
+                    require_root "$@"
+                    local iface="${2:-}"
+                    if [[ "$iface" =~ ^- ]]; then iface=""; else shift; fi
+                    restore_mac_address "$iface"
+                    shift ;;
+                -R|--report)
+                    require_root "$@"
+                    save_security_report
+                    shift ;;
+                --json)
+                    require_root "$@"
+                    JSON_OUTPUT=1
+                    setup_colors
+                    output_raw_json
+                    exit 0 ;;
+                --no-color)
+                    NO_COLOR=1
+                    setup_colors
+                    shift ;;
+                -v|--version)
+                    echo "ArchNetSentry v${VERSION}"
+                    exit 0 ;;
+                -h|--help)
+                    show_help
+                    exit 0 ;;
+                *)
+                    err "Unknown option: $1"
+                    show_help
+                    exit 1 ;;
+            esac
+        done
+        exit 0
+    fi
+
+    # Interactive Mode
+    require_root "$@"
+    while true; do
+        show_banner
+        echo -e "  ${CYAN}[1]${NC} Audit Active Network Listeners & Connections"
+        echo -e "  ${CYAN}[2]${NC} Hunt for Irregular / Sketchy Processes"
+        echo -e "  ${CYAN}[3]${NC} Audit DNS Leaks & Encryption Status"
+        echo -e "  ${GREEN}[4]${NC} Enforce DNS-over-HTTPS / DoT (Cloudflare/Quad9/AdGuard/Mullvad)"
+        echo -e "  ${YELLOW}[5]${NC} Spoof Network Adapter MAC Address"
+        echo -e "  ${YELLOW}[6]${NC} Restore Adapter Original MAC Address"
+        echo -e "  ${MAGENTA}[7]${NC} Generate Unified Security Report (Save Logs)"
+        echo -e "  ${RED}[8]${NC} Exit"
+        echo "===================================================================================================="
+        
+        local choice
+        read -rp "Select an option [1-8]: " choice || break
+
+        case "$choice" in
+            1) audit_network_ports; pause ;;
+            2) hunt_sketchy_processes; pause ;;
+            3) get_dns_status; pause ;;
+            4) 
+                echo -e "\n${CYAN}Select DoH/DoT DNS Provider:${NC}"
+                echo "  [1] Cloudflare (1.1.1.1)"
+                echo "  [2] Quad9 (9.9.9.9)"
+                echo "  [3] AdGuard (94.140.14.14)"
+                echo "  [4] Mullvad (194.242.2.2)"
+                read -rp "Selection [1-4]: " pchoice || pchoice="1"
+                case "$pchoice" in
+                    2) set_secure_dns "quad9" ;;
+                    3) set_secure_dns "adguard" ;;
+                    4) set_secure_dns "mullvad" ;;
+                    *) set_secure_dns "cloudflare" ;;
+                esac
+                pause ;;
+            5) change_mac_address ""; pause ;;
+            6) restore_mac_address ""; pause ;;
+            7) save_security_report; pause ;;
+            8) echo -e "\n${GREEN}Thank you for using ArchNetSentry. Stay Secure!${NC}"; exit 0 ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+main "$@"
